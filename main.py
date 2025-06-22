@@ -1,116 +1,110 @@
-import dlib
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
 from PIL import Image, ImageOps
 import face_recognition
 import numpy as np
+from auth import verify_jwt
 import pickle
 import base64
 import io
 import os
-# from typing import Optional
 
 app = FastAPI()
 
 FACES_FILE = "faces.pkl"
 
-# Load existing encodings
 if os.path.exists(FACES_FILE) and os.path.getsize(FACES_FILE) > 0:
     with open(FACES_FILE, "rb") as f:
         known_faces = pickle.load(f)
 else:
-    known_faces = {}  # {id: [encoding1, encoding2, ...]}
+    known_faces = {}
 
 class RegisterFace(BaseModel):
     id: str
     image_base64: str
 
-@app.post("/register")
-def register_face(data: RegisterFace):
-    try:
-        # Strip prefix if present
-        base64_str = data.image_base64.split(",")[-1]
+def save_faces():
+    with open(FACES_FILE, "wb") as f:
+        pickle.dump(known_faces, f)
 
-        # Decode base64
+@app.post("/register")
+def register_face(data: RegisterFace, user=Depends(verify_jwt)):
+    try:
+        print("Raw image_base64 length:", len(data.image_base64))
+
+        base64_str = data.image_base64.split(",")[-1]
         image_data = base64.b64decode(base64_str)
 
-        # Load image with PIL and ensure it's RGB
+        # Load and standardise image
         image = Image.open(io.BytesIO(image_data)).convert("RGB")
+        print("Loaded format:", image.format)
+        print("Original mode:", image.mode)
+
         image = ImageOps.exif_transpose(image)
+        image.thumbnail((640, 640))
         image = image.copy()
 
-        # Convert to NumPy array with strict dtype
-        image_np = np.array(image, dtype=np.uint8).copy()
+        # Convert to NumPy array
+        image_np = np.array(image)
+        print("Image np dtype before:", image_np.dtype, "Shape:", image_np.shape)
+
+        if image_np.dtype != np.uint8:
+            image_np = image_np.astype(np.uint8)
+
+        if image_np.ndim != 3 or image_np.shape[2] != 3:
+            raise HTTPException(status_code=400, detail="Image must be 3-channel RGB")
+
         image_np = np.ascontiguousarray(image_np)
         image_np.setflags(write=True)
+        print("Final image dtype:", image_np.dtype)
+        print("Is contiguous:", image_np.flags['C_CONTIGUOUS'])
 
-        # Sanity checks
-        if image_np.ndim != 3 or image_np.shape[2] != 3 or image_np.dtype != np.uint8:
-            raise HTTPException(status_code=400, detail="Image must be RGB and 8-bit")
+        # Face encoding
+        face_locations = face_recognition.face_locations(image_np)
 
-        print("Face recognition version:", face_recognition.__version__)
-        print("dlib version:", dlib.__version__)
-        print("Image mode:", image.mode)
-        print("Image shape:", image_np.shape)
-        print("Image dtype:", image_np.dtype)
-        print("Flags:", image_np.flags)
-        print("numpy: ", np.__version__)
+        if not face_locations:
+            raise HTTPException(status_code=400, detail="No face detected in the image")
 
-        # Attempt encoding
-        encodings = face_recognition.face_encodings(image_np)
+        # Then extract encoding
+        encodings = face_recognition.face_encodings(image_np, known_face_locations=face_locations)
+
         if not encodings:
             raise HTTPException(status_code=400, detail="No face detected in the image")
 
         encoding = encodings[0]
 
-        # Load or initialize known_faces
-        if os.path.exists(FACES_FILE) and os.path.getsize(FACES_FILE) > 0:
-            with open(FACES_FILE, "rb") as f:
-                known_faces = pickle.load(f)
-        else:
-            known_faces = {}
+        # Cap at 20 encodings per ID
+        known_faces.setdefault(data.id, [])
+        if len(known_faces[data.id]) >= 20:
+            known_faces[data.id].pop(0)
+        known_faces[data.id].append(encoding)
 
-        known_faces.setdefault(data.id, []).append(encoding)
-
-        # Save back to faces.pkl
-        with open(FACES_FILE, "wb") as f:
-            pickle.dump(known_faces, f)
-
+        save_faces()
         return {"message": f"Face added for ID {data.id}"}
 
     except Exception as e:
         print(f"Error in /register: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-
-
-
 class RecognitionRequest(BaseModel):
     image_base64: str
 
 @app.post("/recognize")
-def recognize_face(data: RecognitionRequest):
+def recognize_face(data: RecognitionRequest, user=Depends(verify_jwt)):
     try:
-        if not os.path.exists(FACES_FILE) or os.path.getsize(FACES_FILE) == 0:
+        if not known_faces:
             raise HTTPException(status_code=404, detail="No registered faces found")
 
-        # Decode incoming image
         image_data = base64.b64decode(data.image_base64)
         image = Image.open(io.BytesIO(image_data)).convert("RGB")
         image_np = np.array(image)
 
-        # Extract encoding
         encodings = face_recognition.face_encodings(image_np)
         if not encodings:
             raise HTTPException(status_code=400, detail="No face detected in the image")
-        
+
         unknown_encoding = encodings[0]
 
-        # Load known faces
-        with open(FACES_FILE, "rb") as f:
-            known_faces = pickle.load(f)
-
-        # Compare with each stored encoding
         for person_id, enc_list in known_faces.items():
             results = face_recognition.compare_faces(enc_list, unknown_encoding, tolerance=0.5)
             if any(results):
@@ -121,6 +115,21 @@ def recognize_face(data: RecognitionRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.delete("/faces")
+def delete_all_faces(user=Depends(verify_jwt)):
+    global known_faces
+    known_faces = {}
+    if os.path.exists(FACES_FILE):
+        os.remove(FACES_FILE)
+    return {"message": "All face encodings deleted successfully."}
+
+@app.delete("/faces/{id}")
+def delete_face_by_id(id: str, user=Depends(verify_jwt)):
+    if id not in known_faces:
+        raise HTTPException(status_code=404, detail=f"No face data found for ID: {id}")
+    del known_faces[id]
+    save_faces()
+    return {"message": f"Face encodings for ID '{id}' deleted successfully."}
 
 
 if __name__ == "__main__":

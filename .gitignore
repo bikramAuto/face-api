@@ -4,6 +4,15 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Uvicorn log files
+*.log
+
+# Uploaded media (if any)
+media/
+uploads/
+
+# FastAPI OpenAPI cache (if generated manually)
+openapi.json
 
 .pkl
 
